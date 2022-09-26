@@ -110,7 +110,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         ),
         apply_overlapped_optimizer_config=st.sampled_from([None]),
         # TODO - need to enable optimizer overlapped behavior for data_parallel tables
-        # apply_overlapped_optimizer_config=st.booleans(),
     )
     @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
     def test_sharding_nccl_dp(

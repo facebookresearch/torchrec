@@ -14,10 +14,6 @@ import torch.distributed as dist
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Global, only should be accessed via intra_and_cross_node_pg()
-_INTRA_PG: Optional[dist.ProcessGroup] = None
-_CROSS_PG: Optional[dist.ProcessGroup] = None
-
 
 def _env2int(env_list: List[str], default: int = -1) -> int:
     for e in env_list:
@@ -98,9 +94,38 @@ def get_num_groups(world_size: Optional[int] = None) -> int:
     return world_size // get_local_size(world_size)
 
 
+# Global, only should be accessed via intra_and_cross_node_pg() and input_dist_pg()
+_INTRA_PG: Optional[dist.ProcessGroup] = None
+_CROSS_PG: Optional[dist.ProcessGroup] = None
+_INPUT_DIST_PG: Optional[dist.ProcessGroup] = None
+
+_INPUT_DIST_NEW_PG: bool = False
+
+
+def set_input_dist_new_pg(val: bool) -> None:
+    global _INPUT_DIST_NEW_PG
+
+    _INPUT_DIST_NEW_PG = val
+
+
+def input_dist_new_pg() -> bool:
+    global _INPUT_DIST_NEW_PG
+
+    return _INPUT_DIST_NEW_PG
+
+
+def input_dist_pg() -> dist.ProcessGroup:
+    global _INPUT_DIST_PG
+
+    if _INPUT_DIST_PG is None:
+        _INPUT_DIST_PG = dist.new_group()
+        dist.barrier()
+    assert _INPUT_DIST_PG is not None
+    return _INPUT_DIST_PG
+
+
 def intra_and_cross_node_pg(
     device: Optional[torch.device] = None,
-    backend: str = "nccl",
 ) -> Tuple[Optional[dist.ProcessGroup], Optional[dist.ProcessGroup]]:
     """
     Creates sub process groups (intra and cross node)
@@ -117,14 +142,7 @@ def intra_and_cross_node_pg(
     local_size = get_local_size(my_size)
     my_group_rank = get_group_rank(my_size, my_rank)
     group_count = get_num_groups(my_size)
-    my_backend = dist.get_backend()
-
-    if my_backend != backend:
-        logger.warn(
-            f"global PG is initialized with backend {my_backend}, while trying to perform intra_and_cross_node_pg with backend {backend}, "
-            f"use the global backend {my_backend} to proceed"
-        )
-        backend = my_backend
+    backend = dist.get_backend()
 
     logger.info(
         f"[{my_rank}] my_local_rank = {my_local_rank}, local_size = {local_size},"

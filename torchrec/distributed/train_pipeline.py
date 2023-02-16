@@ -488,10 +488,19 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        enable_amp: bool = False,
+        enable_grad_scaling: bool = True,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
         self._device = device
+        self._enable_amp = enable_amp
+        self._enable_grad_scaling = enable_grad_scaling
+        self._grad_scaler = torch.cuda.amp.GradScaler(
+          enabled=self._enable_amp and self._enable_grad_scaling
+        )
+        logging.info(f"Amp is enabled: {self._enable_amp}")
+
         # use two data streams to support two concurrent batches
         if device.type == "cuda":
             self._memcpy_stream: Optional[
@@ -501,6 +510,8 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 torch.cuda.streams.Stream
             ] = torch.cuda.Stream()
         else:
+            if self._enable_amp:
+              logging.warning("Amp is enabled, but no CUDA available")
             self._memcpy_stream: Optional[torch.cuda.streams.Stream] = None
             self._data_dist_stream: Optional[torch.cuda.streams.Stream] = None
         self._batch_i: Optional[In] = None
@@ -564,7 +575,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             # before starting forward pass
             if self._data_dist_stream:
                 event = torch.cuda.current_stream().record_event()
-            (losses, output) = cast(Tuple[torch.Tensor, Out], self._model(batch_i))
+            with torch.autocast(
+                device_type=self._device.type,
+                dtype=torch.bfloat16,
+                enabled=self._enable_amp,
+              ):
+                (losses, output) = cast(Tuple[torch.Tensor, Out], self._model(batch_i))
 
         # Data Distribution
         with record_function("## sparse_data_dist ##"):
@@ -580,12 +596,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         if self._model.training:
             # Backward
             with record_function("## backward ##"):
-                torch.sum(losses, dim=0).backward()
+                self._grad_scaler.scale(torch.sum(losses, dim=0)).backward()
 
             # Update
             with record_function("## optimizer ##"):
-                self._optimizer.step()
-
+                self._grad_scaler.step(self._optimizer)
+                self._grad_scaler.update()
         self._batch_i = batch_ip1
         self._batch_ip1 = batch_ip2
 

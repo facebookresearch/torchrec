@@ -51,7 +51,6 @@ def sharding_single_rank(
     constraints: Optional[Dict[str, ParameterConstraints]] = None,
     local_size: Optional[int] = None,
 ) -> None:
-
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input = kjt_input.to(ctx.device)
         unsharded_model = unsharded_model.to(ctx.device)
@@ -117,8 +116,6 @@ class FusedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         sharder_type: str,
         sharding_type: str,
     ) -> None:
-        self.fail("fix test or remove - Test is currently deadlocking and breaking CI")
-
         fused_ebc = FusedEmbeddingBagCollection(
             tables=[
                 EmbeddingBagConfig(
@@ -174,8 +171,6 @@ class FusedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         self,
         sharding_type: str,
     ) -> None:
-        self.fail("fix test or remove - Test is currently deadlocking and breaking CI")
-
         ebc = EmbeddingBagCollection(
             tables=[
                 EmbeddingBagConfig(

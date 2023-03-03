@@ -21,7 +21,6 @@ from torchrec.distributed.planner.shard_estimators import (
     EmbeddingStorageEstimator,
 )
 from torchrec.distributed.quant_embeddingbag import QuantEmbeddingBagCollectionSharder
-from torchrec.distributed.shard import shard_modules
 from torchrec.distributed.test_utils.test_model import (
     _get_default_rtol_and_atol,
     ModelInput,
@@ -34,6 +33,7 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.quant.embedding_modules import (
     EmbeddingBagCollection as QuantEmbeddingBagCollection,
 )
+from torchrec.test_utils import skipIfRocm
 from torchrec.types import CopyMixIn
 
 
@@ -218,6 +218,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         dmp_1 = dmp.copy(device_1)
         self._recursive_device_check(dmp.module, dmp_1.module, device, device_1)
 
+    @skipIfRocm()
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
@@ -292,6 +293,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
             dmp_copy(local_batch[0].to(device)).cpu(),
         )
 
+    @skipIfRocm()
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
@@ -307,6 +309,8 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
     )
     @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
     def test_quant_pred_shard(self, output_type: torch.dtype) -> None:
+        from torchrec.distributed.shard import shard_modules
+
         device = torch.device("cuda:0")
         device_1 = torch.device("cuda:1")
         model = TestSparseNN(

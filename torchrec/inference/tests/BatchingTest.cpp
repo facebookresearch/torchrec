@@ -21,6 +21,7 @@
 #include "torch/library.h"
 #include "torchrec/inference/TestUtils.h"
 #include "torchrec/inference/Types.h"
+#include "torchrec/inference/Utils.h"
 
 namespace torchrec {
 

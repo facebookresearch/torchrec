@@ -670,36 +670,57 @@ class ShardedEmbeddingBagCollection(
         self,
         ctx: EmbeddingBagCollectionContext,
         output: List[torch.Tensor],
-    ) -> LazyAwaitable[KeyedTensor]:
-        return EmbeddingBagCollectionAwaitable(
-            awaitables=[
+    ) -> KeyedTensor:
+        return construct_output_kt(
+            embeddings=[
                 dist(embeddings, sharding_ctx)
+                # .manifest()
                 for dist, sharding_ctx, embeddings in zip(
                     self._output_dists,
                     ctx.sharding_contexts,
                     output,
                 )
             ],
-            embedding_dims=self._embedding_dims,
             embedding_names=self._embedding_names,
+            embedding_dims=self._embedding_dims,
         )
 
     def compute_and_output_dist(
         self, ctx: EmbeddingBagCollectionContext, input: KJTList
-    ) -> LazyAwaitable[KeyedTensor]:
-        return EmbeddingBagCollectionAwaitable(
-            awaitables=[
-                dist(lookup(features), sharding_ctx)
-                for lookup, dist, sharding_ctx, features in zip(
-                    self._lookups,
-                    self._output_dists,
-                    ctx.sharding_contexts,
-                    input,
-                )
-            ],
-            embedding_dims=self._embedding_dims,
+    ) -> KeyedTensor:
+
+        embeddings = [
+            dist(lookup(features), sharding_ctx)
+            #.manifest()
+            for lookup, dist, sharding_ctx, features in zip(
+                self._lookups,
+                self._output_dists,
+                ctx.sharding_contexts,
+                input,
+            )
+        ]
+        return construct_output_kt(
+            embeddings=embeddings,
             embedding_names=self._embedding_names,
+            embedding_dims=self._embedding_dims,
         )
+
+    # def compute_and_output_dist(
+    #     self, ctx: EmbeddingBagCollectionContext, input: KJTList
+    # ) -> LazyAwaitable[KeyedTensor]:
+    #     return EmbeddingBagCollectionAwaitable(
+    #         awaitables=[
+    #             dist(lookup(features), sharding_ctx)
+    #             for lookup, dist, sharding_ctx, features in zip(
+    #                 self._lookups,
+    #                 self._output_dists,
+    #                 ctx.sharding_contexts,
+    #                 input,
+    #             )
+    #         ],
+    #         embedding_dims=self._embedding_dims,
+    #         embedding_names=self._embedding_names,
+    #     )
 
     @property
     def fused_optimizer(self) -> KeyedOptimizer:

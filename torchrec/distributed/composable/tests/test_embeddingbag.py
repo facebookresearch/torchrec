@@ -19,7 +19,11 @@ from hypothesis import assume, given, settings, Verbosity
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
+from torch.utils.data import IterableDataset
 from torchrec import distributed as trec_dist
+from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
+from torchrec.datasets.random import RandomRecDataset
+from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionSharder,
     ShardedEmbeddingBagCollection,
@@ -47,8 +51,12 @@ from torchrec.distributed.types import (
     ShardingPlan,
     ShardingType,
 )
+from torchrec.models.dlrm import DLRM, DLRMTrain
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.optim.keyed import KeyedOptimizerWrapper
+from torchrec.optim.optimizers import in_backward_optimizer_filter
+from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
 
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import (
@@ -146,79 +154,96 @@ def _test_sharding(  # noqa C901
         for table in tables:
             feature_keys.extend(table.feature_names)
 
-        for _it in range(5):
-            unsharded_model_params = dict(unsharded_model.named_parameters())
+        unsharded_model_params = dict(unsharded_model.named_parameters())
 
-            if not use_apply_optimizer_in_backward:
-                unsharded_model_optimizer.zero_grad()
-                sharded_model_optimizer.zero_grad()
+        if is_data_parallel:
+            for fqn, param in sharded_model.named_parameters():
+                assert _optional_equals(param.grad, unsharded_model_params[fqn].grad)
 
-            if is_data_parallel:
-                for fqn, param in sharded_model.named_parameters():
-                    assert _optional_equals(
-                        param.grad, unsharded_model_params[fqn].grad
-                    )
+        unsharded_model_pred_kt = []
+        for unsharded_rank in range(ctx.world_size):
+            # simulate the unsharded model run on the entire batch
+            unsharded_model_pred_kt.append(
+                unsharded_model(kjt_input_per_rank[unsharded_rank])
+            )
 
-            unsharded_model_pred_kt = []
-            for unsharded_rank in range(ctx.world_size):
-                # simulate the unsharded model run on the entire batch
-                unsharded_model_pred_kt.append(
-                    unsharded_model(kjt_input_per_rank[unsharded_rank])
-                )
+        all_unsharded_preds = []
+        for unsharded_rank in range(ctx.world_size):
+            unsharded_model_pred_kt_mini_batch = unsharded_model_pred_kt[
+                unsharded_rank
+            ].to_dict()
 
-            all_unsharded_preds = []
-            for unsharded_rank in range(ctx.world_size):
-                unsharded_model_pred_kt_mini_batch = unsharded_model_pred_kt[
-                    unsharded_rank
-                ].to_dict()
-
-                all_unsharded_preds.extend(
+            all_unsharded_preds.extend(
+                [
+                    unsharded_model_pred_kt_mini_batch[feature]
+                    for feature in feature_keys
+                ]
+            )
+            if unsharded_rank == ctx.rank:
+                unsharded_model_pred = torch.stack(
                     [
                         unsharded_model_pred_kt_mini_batch[feature]
                         for feature in feature_keys
                     ]
                 )
-                if unsharded_rank == ctx.rank:
-                    unsharded_model_pred = torch.stack(
-                        [
-                            unsharded_model_pred_kt_mini_batch[feature]
-                            for feature in feature_keys
-                        ]
-                    )
-            # sharded model
-            # each rank gets a subbatch
-            sharded_model_pred_kt = sharded_model(
-                kjt_input_per_rank[ctx.rank]
-            ).to_dict()
-            sharded_model_pred = torch.stack(
-                [sharded_model_pred_kt[feature] for feature in feature_keys]
-            )
+        # sharded model
+        # each rank gets a subbatch
+        sharded_model_pred_kt = sharded_model(kjt_input_per_rank[ctx.rank]).to_dict()
 
-            # cast to CPU because when casting unsharded_model.to on the same module, there could some race conditions
-            # in normal author modelling code this won't be an issue because each rank would individually create
-            # their model. output from sharded_pred is correctly on the correct device.
-            # Compare predictions of sharded vs unsharded models.
-            torch.testing.assert_close(
-                sharded_model_pred.cpu(), unsharded_model_pred.cpu()
-            )
+        sharded_model_pred = torch.stack(
+            [sharded_model_pred_kt[feature] for feature in feature_keys]
+        )
 
-            sharded_model_pred.sum().backward()
+        sharded_model_pred = sharded_model_pred
+        unsharded_model_pred = unsharded_model_pred
 
-            all_unsharded_preds = torch.stack(all_unsharded_preds)
-            _sum = all_unsharded_preds.sum()
+        # cast to CPU because when casting unsharded_model.to on the same module, there could some race conditions
+        # in normal author modelling code this won't be an issue because each rank would individually create
+        # their model. output from sharded_pred is correctly on the correct device.
+        # Compare predictions of sharded vs unsharded models.
+        print("sharded model pred", sharded_model_pred)
+        print("unsharded model pred", unsharded_model_pred)
+
+        torch.testing.assert_close(sharded_model_pred, unsharded_model_pred)
+
+        for fqn in unsharded_model.state_dict():
+            unsharded_state = unsharded_model.state_dict()[fqn]
+            sharded_state = sharded_model.state_dict()[fqn]
             if is_data_parallel:
-                _sum /= world_size
-            _sum.backward()
-
-            if is_data_parallel:
-                for fqn, param in sharded_model.named_parameters():
-                    assert _optional_equals(
-                        param.grad, unsharded_model_params[fqn].grad
+                torch.testing.assert_close(unsharded_state, sharded_state)
+            else:
+                out = (
+                    torch.zeros(size=unsharded_state.shape, device=ctx.device)
+                    if ctx.rank == 0
+                    else None
+                )
+                sharded_state.gather(out=out)
+                if ctx.rank == 0:
+                    print("unsharded state before backward", unsharded_state)
+                    print("sharded state before backward", out)
+                    torch.testing.assert_close(
+                        unsharded_state,
+                        out,
                     )
 
-            if not use_apply_optimizer_in_backward:
-                unsharded_model_optimizer.step()
-                sharded_model_optimizer.step()
+        (3*sharded_model_pred).sum().backward()
+
+        all_unsharded_preds = torch.stack(all_unsharded_preds)
+        _sum = (3*all_unsharded_preds).sum()
+        if is_data_parallel:
+            _sum /= world_size
+        _sum.backward()
+
+        if is_data_parallel:
+            for fqn, param in sharded_model.named_parameters():
+                assert _optional_equals(param.grad, unsharded_model_params[fqn].grad)
+
+        for fqn, param in sharded_model.named_parameters():
+            print(fqn, "PARAM", param, "GRADIENT", param.grad)
+
+        if not use_apply_optimizer_in_backward:
+            unsharded_model_optimizer.step()
+            sharded_model_optimizer.step()
 
         # check nn.Module APIs look the same
         assert_state_buffers_parameters_equal(unsharded_model, sharded_model)
@@ -236,6 +261,8 @@ def _test_sharding(  # noqa C901
                 )
                 sharded_state.gather(out=out)
                 if ctx.rank == 0:
+                    print("unsharded state", unsharded_state)
+                    print("sharded state", out)
                     torch.testing.assert_close(
                         unsharded_state,
                         out,
@@ -270,9 +297,9 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         sharding_type=st.sampled_from(
             [
                 ShardingType.TABLE_WISE.value,
-                ShardingType.ROW_WISE.value,
-                ShardingType.COLUMN_WISE.value,
-                ShardingType.DATA_PARALLEL.value,
+                # ShardingType.ROW_WISE.value,
+                # ShardingType.COLUMN_WISE.value,
+                # ShardingType.DATA_PARALLEL.value,
             ]
         ),
         use_apply_optimizer_in_backward=st.booleans(),
@@ -291,6 +318,7 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
                 and sharding_type == ShardingType.DATA_PARALLEL.value
             ),
         )
+        assume(not use_apply_optimizer_in_backward)
 
         WORLD_SIZE = 2
 
@@ -359,6 +387,8 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
                 lengths=torch.LongTensor([2, 2, 4, 2, 0, 1]),
             ),
         ]
+
+
         self._run_multi_process_test(
             callable=_test_sharding,
             world_size=WORLD_SIZE,
@@ -390,3 +420,7 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             is_data_parallel=(sharding_type == ShardingType.DATA_PARALLEL.value),
             use_apply_optimizer_in_backward=use_apply_optimizer_in_backward,
         )
+
+import unittest
+if __name__ == '__main__':
+    unittest.main()

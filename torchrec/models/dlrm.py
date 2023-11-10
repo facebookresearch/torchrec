@@ -14,6 +14,8 @@ from torchrec.modules.crossnet import LowRankCrossNet
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.modules.mlp import MLP
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
+from torch.autograd.profiler import record_function
+
 
 
 def choose(n: int, k: int) -> int:
@@ -96,14 +98,17 @@ class SparseArch(nn.Module):
             torch.Tensor: tensor of shape B X F X D.
         """
 
-        sparse_features: KeyedTensor = self.embedding_bag_collection(features)
+        with record_function("# running sparse arch"):
+            sparse_features: KeyedTensor = self.embedding_bag_collection(features)
 
-        sparse: Dict[str, torch.Tensor] = sparse_features.to_dict()
-        sparse_values: List[torch.Tensor] = []
-        for name in self.sparse_feature_names:
-            sparse_values.append(sparse[name])
+        # this won't block on a2a .wait() finishing. It will schedule on separate stream immediately
+        with record_function("# running sparse arch user post process"):
+            sparse: Dict[str, torch.Tensor] = sparse_features.to_dict()
+            sparse_values: List[torch.Tensor] = []
+            for name in self.sparse_feature_names:
+                sparse_values.append(sparse[name])
 
-        return torch.cat(sparse_values, dim=1).reshape(-1, self.F, self.D)
+            return torch.cat(sparse_values, dim=1).reshape(-1, self.F, self.D)
 
     @property
     def sparse_feature_names(self) -> List[str]:
@@ -146,7 +151,8 @@ class DenseArch(nn.Module):
         Returns:
             torch.Tensor: an output tensor of size B X D.
         """
-        return self.model(features)
+        with record_function("# running dense_arch"):
+            return self.model(features)
 
 
 class InteractionArch(nn.Module):
@@ -202,18 +208,32 @@ class InteractionArch(nn.Module):
             return dense_features
         (B, D) = dense_features.shape
 
-        combined_values = torch.cat(
-            (dense_features.unsqueeze(1), sparse_features), dim=1
-        )
+        # print("SPARSE FEATURES", sparse_features, sparse_features.device)
+        # print("should not be syncing yet")
+        with record_function("interaction arch cat"):
+            combined_values = torch.cat(
+                (dense_features.unsqueeze(1), sparse_features), dim=1
+            )
+        # print("should be synced")
 
         # dense/sparse + sparse/sparse interaction
         # size B X (F + F choose 2)
-        interactions = torch.bmm(
-            combined_values, torch.transpose(combined_values, 1, 2)
-        )
-        interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
+        with record_function("interaction arch bmm"):
+            interactions = torch.bmm(combined_values, combined_values.transpose(1, 2))
+        # print("YING DEBUG INTERACTION", interactions)
+        # print("interactions before manifesting", interactions)
+        # TODO this manifest should happen automatically if interacting with non async tensor
+        # interactions = interactions.manifest()
+        # print("YING DEBUG INTERACTION AFTER MANIFEST", interactions)
 
-        return torch.cat((dense_features, interactions_flat), dim=1)
+        with record_function("interaction arch flat"):
+            interactions_flat = interactions[
+                :, self.triu_indices[0], self.triu_indices[1]
+            ]
+
+        with record_function("interaction arch cat"):
+            ret = torch.cat((dense_features, interactions_flat), dim=1)
+        return ret
 
 
 class InteractionDCNArch(nn.Module):
@@ -567,8 +587,12 @@ class DLRM(nn.Module):
         Returns:
             torch.Tensor: logits.
         """
-        embedded_dense = self.dense_arch(dense_features)
         embedded_sparse = self.sparse_arch(sparse_features)
+        embedded_dense = self.dense_arch(dense_features)
+        # communication on output_dist stream
+        
+
+        # here syncronize main stream and output dist stream
         concatenated_dense = self.inter_arch(
             dense_features=embedded_dense, sparse_features=embedded_sparse
         )

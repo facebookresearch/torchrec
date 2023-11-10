@@ -305,7 +305,7 @@ def alltoall_pooled(
     cumsum_dim_sum_per_rank_tensor: Optional[Tensor] = None,
     group: Optional[dist.ProcessGroup] = None,
     codecs: Optional[QuantizedCommCodecs] = None,
-) -> Awaitable[Tensor]:
+) -> Tensor:
     """
     Performs AlltoAll operation for a single pooled embedding tensor. Each process
     splits the input pooled embeddings tensor based on the world size, and then scatters
@@ -339,19 +339,46 @@ def alltoall_pooled(
     if group is None:
         group = dist.distributed_c10d._get_default_group()
 
-    if dist.get_world_size(group) <= 1:
-        return NoWait(a2a_pooled_embs_tensor)
+    input_embeddings = a2a_pooled_embs_tensor
+    my_rank = dist.get_rank(group)
+    (B_global, D_local_sum) = input_embeddings.shape
 
-    myreq = Request(group, device=a2a_pooled_embs_tensor.device)
-    a2ai = All2AllPooledInfo(
-        batch_size_per_rank=batch_size_per_rank,
-        dim_sum_per_rank=dim_sum_per_rank,
-        dim_sum_per_rank_tensor=dim_sum_per_rank_tensor,
-        cumsum_dim_sum_per_rank_tensor=cumsum_dim_sum_per_rank_tensor,
-        codecs=codecs,
+    dim_sum_per_rank = dim_sum_per_rank
+    batch_size_per_rank = batch_size_per_rank
+    B_local = batch_size_per_rank[my_rank]
+
+    assert B_global == sum(batch_size_per_rank)
+
+    sharded_input_embeddings = input_embeddings.view(-1)
+    output_split_sizes = [B_local * D_rank_sum for D_rank_sum in dim_sum_per_rank]
+    input_split_sizes = [D_local_sum * B_rank for B_rank in batch_size_per_rank]
+
+    from torchrec.distributed import stream_sync_tensor
+
+    if codecs is not None:
+        with record_function("## codecs encode"):
+            codecs = none_throws(codecs)
+            qcomm_ctx = codecs.forward.create_context()
+            # DO ENCODe/DECODE HAVE AUTOGRAD DEFINED?
+            sharded_input_embeddings = codecs.forward.encode(sharded_input_embeddings)
+
+    sharded_output_embeddings = stream_sync_tensor.all_to_all_single(
+        sharded_input_embeddings,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=group,
     )
-    All2All_Pooled_Req.apply(group, myreq, a2ai, a2a_pooled_embs_tensor)
-    return myreq
+
+    if codecs is not None:
+        with record_function("## codecs decode"):
+            codecs = none_throws(codecs)
+            sharded_output_embeddings = codecs.forward.decode(sharded_output_embeddings, qcomm_ctx)
+
+    outputs_by_rank = sharded_output_embeddings.split(
+        [B_local * D_rank_sum for D_rank_sum in dim_sum_per_rank]
+    )
+    result = torch.cat([output.view(B_local, -1) for output in outputs_by_rank], dim=1)
+    return result
 
 
 def variable_batch_alltoall_pooled(

@@ -33,10 +33,13 @@ from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
 from tqdm import tqdm
 
+DEFAULT_CAT_NAMES = [f"f{idx}" for idx in range(64)]
+DEFAULT_INT_NAMES: List[str] = [f"int_{idx}" for idx in range(1024)]
+
 
 def _get_random_dataset(
     num_embeddings: int,
-    batch_size: int = 32,
+    batch_size: int = 4096,
 ) -> IterableDataset:
     return RandomRecDataset(
         keys=DEFAULT_CAT_NAMES,
@@ -53,8 +56,9 @@ def main() -> None:
 
 
 def train(
-    num_embeddings: int = 1024**2,
-    embedding_dim: int = 128,
+    num_embeddings: int = 1024,
+    # **2,
+    embedding_dim: int = 1024,
     dense_arch_layer_sizes: Optional[List[int]] = None,
     over_arch_layer_sizes: Optional[List[int]] = None,
     learning_rate: float = 0.1,
@@ -72,9 +76,9 @@ def train(
     The effects of quantized comms will be most apparent in large training jobs across multiple nodes where inter host communication is expensive.
     """
     if dense_arch_layer_sizes is None:
-        dense_arch_layer_sizes = [64, embedding_dim]
+        dense_arch_layer_sizes = [2049, 2049, 2049, 2049, 2049, 2049, embedding_dim]
     if over_arch_layer_sizes is None:
-        over_arch_layer_sizes = [64, 1]
+        over_arch_layer_sizes = [512, 1]
 
     # Init process_group , device, rank, backend
     rank = int(os.environ["LOCAL_RANK"])
@@ -138,12 +142,6 @@ def train(
         dict(in_backward_optimizer_filter(model.named_parameters())),
         lambda params: torch.optim.Adagrad(params, lr=learning_rate),
     )
-    # Overlap comm/compute/device transfer during training through train_pipeline
-    train_pipeline = TrainPipelineSparseDist(
-        model,
-        non_fused_optimizer,
-        device,
-    )
 
     # train model
     train_iterator = iter(
@@ -151,8 +149,31 @@ def train(
             num_embeddings=num_embeddings,
         )
     )
-    for _ in tqdm(range(int(num_iterations)), mininterval=5.0):
-        train_pipeline.progress(train_iterator)
+
+    batches = [next(train_iterator).to(device) for _ in range(15)]
+    train_iterator = iter(batches)
+
+    train_pipeline = TrainPipelineSparseDist(
+        model,
+        non_fused_optimizer,
+        device,
+    )
+
+    with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=1, warmup=4, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./trace/sst_long_a2a_optimizer_qcomm_trace'),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False
+    ) as prof:
+        for i in range(15):
+            # print("on iteration i", i)
+            train_pipeline.progress(train_iterator)
+            prof.step()
+
+    # Overlap comm/compute/device transfer during training through train_pipeline
+    # for _ in tqdm(range(int(num_iterations)), mininterval=5.0):
+    #     train_pipeline.progress(train_iterator)
 
 
 if __name__ == "__main__":

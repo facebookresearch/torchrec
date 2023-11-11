@@ -7,8 +7,10 @@
 
 import os
 from typing import List, Optional
+import time
 
 import torch
+import torch._dynamo.config
 from torch import distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import (
@@ -42,7 +44,7 @@ def _get_random_dataset(
         keys=DEFAULT_CAT_NAMES,
         batch_size=batch_size,
         hash_size=num_embeddings,
-        ids_per_feature=1,
+        ids_per_feature=3,
         num_dense=len(DEFAULT_INT_NAMES),
     )
 
@@ -151,9 +153,446 @@ def train(
             num_embeddings=num_embeddings,
         )
     )
-    for _ in tqdm(range(int(num_iterations)), mininterval=5.0):
-        train_pipeline.progress(train_iterator)
 
+    # First time we run the model it does some register_buffer which Dynamo
+    # chokes on
+    print(model(next(train_iterator).to(device)))  # warmup, input dists
+
+    train_model.forward = torch.compile(fullgraph=True, backend="eager")(train_model.forward)
+
+    print(model(next(train_iterator).to(device)))
+    print(model(next(train_iterator).to(device)))
+    print(model(next(train_iterator).to(device)))
+
+    #for _ in tqdm(range(int(num_iterations)), mininterval=5.0):
+    #    train_pipeline.progress(train_iterator)
+
+import torch.library
+fbgemm_meta_lib = torch.library.Library("fbgemm", "IMPL", "Meta")
+
+def register_meta(op_name, overload_name="default"):
+    def wrapper(fn):
+        fbgemm_meta_lib.impl(getattr(getattr(torch.ops.fbgemm, op_name), overload_name), fn)
+        return fn
+
+    return wrapper
+
+
+from torch._prims_common import check
+from fbgemm_gpu.split_embedding_configs import SparseType
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import PoolingMode
+
+def getScalarType(output_dtype: int):
+    return SparseType.from_int(output_dtype).as_dtype()
+
+@register_meta("bounds_check_indices")
+def bounds_check_indices_meta(rows_per_table, indices, offsets, bounds_check_mode, warning, weights=None, B_offsets=None, max_B=-1):
+    pass
+
+@register_meta("split_embedding_codegen_forward_cpu")
+def split_embedding_codegen_forward_cpu_meta(weights, weights_offsets, D_offsets, total_D, hash_size_cumsum, indices, offsets, pooling_mode, indice_weights, output_dtype):
+    T = D_offsets.numel() - 1
+    check(T > 0, lambda: f"expect T > 0, but got {T} (from D_offsets.size() = {D_offsets.size()})")
+    B = (offsets.size(0) - 1) // T
+    check(B >= 0, lambda: f"expect B >= 0, but got {B} (from {offsets.size(0)})")
+
+    dt = getScalarType(output_dtype)
+    output = weights.new_empty((B, total_D), dtype=dt)
+
+    assert indice_weights is None or indice_weights.dtype != torch.float16
+
+    return output
+
+"""
+# this is the cpu one
+@register_meta("split_embedding_codegen_lookup_rowwise_adagrad_function")
+def split_embedding_codegen_lookup_rowwise_adagrad_function_meta(host_weights, weights_placements, weights_offsets, D_offsets, total_D, max_D, hash_size_cumsum, total_hash_size_bits, indices, offsets, pooling_mode, indice_weights, feature_requires_grad, gradient_clipping, max_gradient, stochastic_rounding, momentum1_host, momentum1_placements, momentum1_offsets, eps = 0, learning_rate = 0, weight_decay = 0.0, weight_decay_mode = 0, max_norm = 0.0, output_dtype=0):
+    return split_embedding_codegen_forward_cpu_meta(host_weights, weights_offsets, D_offsets, total_D, hash_size_cumsum, indices, offsets, pooling_mode, indice_weights, output_dtype)
+"""
+
+kINT8QparamsBytes = 8
+
+@register_meta("split_embedding_codegen_lookup_rowwise_adagrad_function")
+def split_embedding_codegen_lookup_rowwise_adagrad_function_meta(
+    placeholder_autograd_tensor,
+    dev_weights, uvm_weights,
+    lxu_cache_weights,
+    weights_placements,
+    weights_offsets,
+    D_offsets,
+    total_D,
+    max_D,
+    hash_size_cumsum,
+    total_hash_size_bits,
+    indices,
+    offsets,
+    pooling_mode,
+    indice_weights,
+    feature_requires_grad,
+    lxu_cache_locations,
+    gradient_clipping,
+    max_gradient,
+    stochastic_rounding,
+    momentum1_dev,
+    momentum1_uvm,
+    momentum1_placements,
+    momentum1_offsets,
+    eps = 0,
+    learning_rate = 0,
+    weight_decay = 0.0,
+    weight_decay_mode = 0,
+    max_norm = 0.0,
+    output_dtype=0,
+    B_offsets=None,
+    vbe_output_offsets_feature_rank=None,
+    vbe_B_offsets_rank_per_feature=None,
+    max_B=-1,
+    max_B_feature_rank=-1,
+    vbe_output_size=-1,
+    is_experimental=False,
+):
+    if B_offsets is not None:
+        assert False
+    else:
+        if pooling_mode is PoolingMode.NONE:
+            # SplitNoBagLookupFunction_rowwise_adagrad_Op
+            # -> split_embedding_nobag_codegen_forward_unweighted_cuda
+            total_L = indices.numel()
+            T = weights_offsets.numel()
+            check(T > 0, lambda: "T > 0")
+            total_B = offsets.size(0) - 1
+            B = total_B // T
+            check(B >= 0, lambda: "B >= 0")
+            D = max_D  # per SplitNoBagLookupFunction_rowwise_adagrad_Op
+            check(D > 0, lambda: "D > 0")
+            check(D % 4 == 0, lambda: "D % 4 == 0")
+            assert SparseType.from_int(output_dtype) in (SparseType.FP32, SparseType.FP16, SparseType.BF16, SparseType.INT8)
+            adjusted_D = D
+            if output_dtype == SparseType.INT8:
+                adjusted_D += T * kINT8QparamsBytes
+            output = dev_weights.new_empty((total_L, adjusted_D), dtype=getScalarType(output_dtype))
+            return output
+        else:
+            # SplitLookupFunction_rowwise_adagrad_Op
+            if indice_weights is None:
+                # split_embedding_codegen_forward_unweighted_cuda
+                T = weights_offsets.numel()
+                check(T > 0, lambda: "T > 0")
+                total_B = offsets.size(0) - 1
+                B = total_B // T
+                check(B >= 0, lambda: "B >= 0")
+                check(total_D >= 0, lambda: "")
+                check(total_D % 4 == 0, lambda: "")
+                check(max_D <= 1024, lambda: "")
+                assert SparseType.from_int(output_dtype) in (SparseType.FP32, SparseType.FP16, SparseType.BF16, SparseType.INT8)
+                total_adjusted_D = total_D
+                if output_dtype == SparseType.INT8:
+                    total_adjusted_D += T * kINT8QparamsBytes
+                output = dev_weights.new_empty((B, total_adjusted_D), dtype=getScalarType(output_dtype))
+                return output
+
+            else:
+                assert False
+
+@register_meta("permute_2D_sparse_data")
+def permute_2D_sparse_data_meta(permute, lengths, values, weights=None, permuted_lengths_sum=None):
+    check(lengths.dim() == 2, lambda: "")
+    T = permute.numel()
+    B = lengths.size(1)
+    indices = values
+    permuted_lengths = lengths.new_empty([T, B])
+    permuted_indices_size = 0
+    if permuted_lengths_sum is not None:
+        permuted_indices_size = permuted_lengths_sum
+    else:
+        raise NotImplementedError("TODO: data dependent permute_2D")
+    permuted_indices = indices.new_empty(permuted_indices_size)
+    permuted_weights = None
+    if weights is not None:
+        permuted_weights = weights.new_empty(permuted_indices_size)
+    return permuted_lengths, permuted_indices, permuted_weights
+
+
+@register_meta("permute_1D_sparse_data")
+def permute_1D_sparse_data_meta(permute, lengths, values, weights=None, permuted_lengths_sum=None):
+    indices = values
+    permuted_lengths_size = permute.numel()
+    permuted_lengths = lengths.new_empty([permuted_lengths_size])
+    permuted_indices_size = 0
+    if permuted_lengths_sum is not None:
+        permuted_indices_size = permuted_lengths_sum
+    else:
+        raise NotImplementedError("TODO: data dependent permute_1D")
+    permuted_indices = indices.new_empty(permuted_indices_size)
+    permuted_weights = None
+    if weights is not None:
+        permuted_weights = weights.new_empty(permuted_indices_size)
+    return permuted_lengths, permuted_indices, permuted_weights
+
+
+@register_meta("expand_into_jagged_permute")
+def expand_into_jagged_permute_meta(permute, input_offsets, output_offsets, output_size):
+    torch._check(permute.numel() > 0, lambda: "")
+    torch._check(permute.numel() == input_offsets.numel() - 1, lambda: "")
+    torch._check(permute.numel() == output_offsets.numel() - 1, lambda: "")
+    output_permute = input_offsets.new_empty(output_size)
+    return output_permute
+
+
+DEFAULT_INFO_NUM_BITS = 32
+DEFAULT_INFO_B_NUM_BITS = 26
+DEFAULT_INFO_B_MASK = (1 << DEFAULT_INFO_B_NUM_BITS) - 1
+MAX_T = (1 << (DEFAULT_INFO_NUM_BITS - DEFAULT_INFO_B_NUM_BITS)) - 1
+MAX_B = (1 << DEFAULT_INFO_B_NUM_BITS) - 1
+
+
+def adjust_info_B_num_bits(B, T):
+    """
+    if dist.get_rank() == 0:
+        breakpoint()
+    else:
+        time.sleep(99999999)
+    """
+    info_B_num_bits = DEFAULT_INFO_B_NUM_BITS
+    info_B_mask = DEFAULT_INFO_B_MASK
+
+    return info_B_num_bits, info_B_mask  # YOLOOOOO
+
+    max_T = MAX_T
+    max_B = MAX_B
+    invalid_T = T > max_T
+    invalid_B = B > max_B
+
+    torch._check(not (invalid_T and invalid_B), lambda: f"Not enough infos bits to accommodate T and B. Default num bits = {DEFAULT_INFO_NUM_BITS}")
+
+    if invalid_T:
+        # Reduce info_B_num_bits
+        while invalid_T and not invalid_B and info_B_num_bits > 0:
+            info_B_num_bits -= 1
+            max_T = ((max_T + 1) << 1) - 1
+            max_B = ((max_B + 1) >> 1) - 1
+            invalid_T = T > max_T
+            invalid_B = B > max_B
+    elif invalid_B:
+        # Increase info_B_num_bits
+        while not invalid_T and invalid_B and info_B_num_bits < DEFAULT_INFO_NUM_BITS:
+            info_B_num_bits += 1
+            max_T = ((max_T + 1) >> 1) - 1
+            max_B = ((max_B + 1) << 1) - 1
+            invalid_T = T > max_T
+            invalid_B = B > max_B
+
+    torch._check(not invalid_T and not invalid_B, lambda: f"Not enough infos bits to accommodate T and B. Default num bits = {DEFAULT_INFO_NUM_BITS}")
+
+    info_B_mask = (1 << info_B_num_bits) - 1
+
+    return info_B_num_bits, info_B_mask
+
+
+class SplitLookupFunction_rowwise_adagrad_Op(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,
+        placeholder_autograd_tensor,
+        output_dtype,
+        dev_weights,
+        uvm_weights,
+        lxu_cache_weights,
+        weights_placements,
+        weights_offsets,
+        D_offsets,
+        total_D,
+        max_D,
+        hash_size_cumsum,
+        total_hash_size_bits,
+        indices,
+        offsets,
+        pooling_mode,
+        indice_weights,
+        feature_requires_grad,
+        lxu_cache_locations,
+        gradient_clipping,
+        max_gradient,
+        stochastic_rounding,
+        is_experimental,
+        momentum1_dev,
+        momentum1_uvm,
+        momentum1_placements,
+        momentum1_offsets,
+        eps = 0,
+        learning_rate = 0,
+        weight_decay = 0.0,
+        weight_decay_mode = 0,
+        max_norm = 0.0,
+    ):
+        T = weights_offsets.numel()
+        max_B_ = offsets.size(0) // T
+
+        info_B_num_bits, info_B_mask = adjust_info_B_num_bits(max_B_, T)
+
+        ctx.save_for_backward(
+            dev_weights,
+            uvm_weights,
+            lxu_cache_weights,
+            weights_placements,
+            weights_offsets,
+            D_offsets,
+            hash_size_cumsum,
+            indices,
+            offsets,
+            indice_weights,
+            feature_requires_grad,
+            lxu_cache_locations,
+            momentum1_dev, momentum1_uvm, momentum1_placements, momentum1_offsets
+        )
+        ctx.max_D = max_D
+        ctx.pooling_mode = pooling_mode
+        ctx.total_hash_size_bits = total_hash_size_bits
+        ctx.gradient_clipping = gradient_clipping
+        ctx.max_gradient = max_gradient
+        ctx.stochastic_rounding = stochastic_rounding
+        ctx.info_B_num_bits = info_B_num_bits
+        ctx.info_B_mask = info_B_mask
+        ctx.eps = eps
+        ctx.learning_rate = learning_rate
+        ctx.weight_decay = weight_decay
+        ctx.weight_decay_mode = weight_decay_mode
+        ctx.max_norm = max_norm
+
+        flatten_dev_weights = dev_weights
+
+        if indice_weights is None:
+            return torch.ops.fbgemm.split_embedding_codegen_forward_unweighted_cuda.default(
+                flatten_dev_weights,
+                uvm_weights,
+                lxu_cache_weights,
+                weights_placements,
+                weights_offsets,
+                D_offsets,
+                total_D,
+                max_D,
+                indices,
+                offsets,
+                pooling_mode,
+                lxu_cache_locations,
+                output_dtype,
+                is_experimental
+            )
+        else:
+            assert False, "y"
+
+    @staticmethod
+    def backward(ctx):
+        assert False
+
+
+@torch.ops.fbgemm.split_embedding_codegen_lookup_rowwise_adagrad_function.default.py_impl(torch._C.DispatchKey.AutogradCUDA)
+def split_embedding_codegen_lookup_rowwise_adagrad_function(
+    placeholder_autograd_tensor,
+    dev_weights, uvm_weights,
+    lxu_cache_weights,
+    weights_placements,
+    weights_offsets,
+    D_offsets,
+    total_D,
+    max_D,
+    hash_size_cumsum,
+    total_hash_size_bits,
+    indices,
+    offsets,
+    pooling_mode,
+    indice_weights,
+    feature_requires_grad,
+    lxu_cache_locations,
+    gradient_clipping,
+    max_gradient,
+    stochastic_rounding,
+    momentum1_dev,
+    momentum1_uvm,
+    momentum1_placements,
+    momentum1_offsets,
+    eps = 0,
+    learning_rate = 0,
+    weight_decay = 0.0,
+    weight_decay_mode = 0,
+    max_norm = 0.0,
+    output_dtype=0,
+    B_offsets=None,
+    vbe_output_offsets_feature_rank=None,
+    vbe_B_offsets_rank_per_feature=None,
+    max_B=-1,
+    max_B_feature_rank=-1,
+    vbe_output_size=-1,
+    is_experimental=False,
+):
+    if B_offsets is not None:
+        assert False, "a"
+    else:
+        if pooling_mode is PoolingMode.NONE:
+            assert False, "b"
+        else:
+            return SplitLookupFunction_rowwise_adagrad_Op.apply(
+                placeholder_autograd_tensor,
+                output_dtype,
+                dev_weights,
+                uvm_weights,
+                lxu_cache_weights,
+                weights_placements,
+                weights_offsets,
+                D_offsets,
+                total_D,
+                max_D,
+                hash_size_cumsum,
+                total_hash_size_bits,
+                indices,
+                offsets,
+                pooling_mode,
+                indice_weights,
+                feature_requires_grad,
+                lxu_cache_locations,
+                gradient_clipping,
+                max_gradient,
+                stochastic_rounding,
+                is_experimental,
+                momentum1_dev, momentum1_uvm, momentum1_placements, momentum1_offsets, eps, learning_rate, weight_decay, weight_decay_mode, max_norm
+            )[0]
+
+
+
+@register_meta("split_embedding_codegen_forward_unweighted_cuda")
+def split_embedding_codegen_forward_unweighted_cuda_meta(
+    dev_weights,
+    uvm_weights,
+    lxu_cache_weights,
+    weights_placements,
+    weights_offsets,
+    D_offsets,
+    total_D,
+    max_D,
+    indices,
+    offsets,
+    pooling_mode,
+    lxu_cache_locations,
+    output_dtype,
+    is_experimental
+):
+    T = D_offsets.numel() - 1
+    torch._check(T > 0, lambda: "")
+    total_B = offsets.size(0) - 1
+    B = total_B // T
+    torch._check(B >= 0, lambda: "")
+    torch._check(total_D > 0, lambda: "")
+    torch._check(total_D % 4 == 0, lambda: "")
+    torch._check(max_D <= 1024, lambda: "")
+    o_dtype = getScalarType(output_dtype)
+    total_adjusted_D = total_D
+    assert output_dtype is not torch.int8  # TODO
+    output = dev_weights.new_empty((B, total_adjusted_D), dtype=o_dtype)
+    return output
+
+
+torch._dynamo.config.optimize_ddp = False
+torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
 if __name__ == "__main__":
     main()

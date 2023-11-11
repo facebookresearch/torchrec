@@ -9,9 +9,11 @@ import itertools
 import logging
 from typing import Callable, Dict, List, Optional
 
+from torch.distributed._functional_collectives import all_to_all_single
 import torch
 import torch.distributed as dist
 from torch import nn
+import torch.export
 from torch.autograd.profiler import record_function
 from torchrec.distributed.comm_ops import (
     all_gather_base_pooled,
@@ -21,10 +23,29 @@ from torchrec.distributed.comm_ops import (
     reduce_scatter_v_pooled,
     variable_batch_alltoall_pooled,
 )
+import torch.export
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.types import Awaitable, QuantizedCommCodecs
 from torchrec.fx.utils import fx_marker
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+import operator
+def accumulate(iterable, func=operator.add, *, initial=None):
+    'Return running totals'
+    # accumulate([1,2,3,4,5]) --> 1 3 6 10 15
+    # accumulate([1,2,3,4,5], initial=100) --> 100 101 103 106 110 115
+    # accumulate([1,2,3,4,5], operator.mul) --> 1 2 6 24 120
+    it = iter(iterable)
+    total = initial
+    if initial is None:
+        try:
+            total = next(it)
+        except StopIteration:
+            return
+    yield total
+    for element in it:
+        total = func(total, element)
+        yield total
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
@@ -92,19 +113,15 @@ def _get_recat(
             for j in feature_order:  # range(num_splits):
                 recat.append(i + j * local_split)
 
-        # variable batch size
-        if batch_size_per_rank is not None and any(
-            bs != batch_size_per_rank[0] for bs in batch_size_per_rank
-        ):
-            batch_size_per_feature = list(
-                itertools.chain.from_iterable(
-                    itertools.repeat(x, local_split) for x in batch_size_per_rank
-                )
-            )
+        # assume variable batch size
+        if batch_size_per_rank is not None:
+            batch_size_per_feature = []
+            for x in batch_size_per_rank:
+                batch_size_per_feature.extend([x] * local_split)
             permuted_batch_size_per_feature = [batch_size_per_feature[r] for r in recat]
-            input_offset = [0] + list(itertools.accumulate(batch_size_per_feature))
+            input_offset = [0] + list(accumulate(batch_size_per_feature))
             output_offset = [0] + list(
-                itertools.accumulate(permuted_batch_size_per_feature)
+                accumulate(permuted_batch_size_per_feature)
             )
             recat_tensor = torch.tensor(
                 recat,
@@ -156,16 +173,14 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                 dtype=input_tensors[0].dtype,
             )
             input_tensor = torch.stack(input_tensors, dim=1).flatten()
-            self._splits_awaitable: dist.Work = dist.all_to_all_single(
-                output=self._output_tensor,
-                input=input_tensor,
-                group=pg,
-                async_op=True,
-            )
+            self._output_tensor = all_to_all_single(input_tensor, None, None, group=pg)
 
     def _wait_impl(self) -> List[List[int]]:
-        self._splits_awaitable.wait()
-        return self._output_tensor.view(self.num_workers, -1).T.tolist()
+        rs = self._output_tensor.view(self.num_workers, -1).T.tolist()
+        for r in rs:
+            for s in r:
+                torch.export.constrain_as_size(s)
+        return rs
 
 
 class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
@@ -236,21 +251,15 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
             input_tensors,
             labels,
         ):
+            for s in output_split:
+                torch.export.constrain_as_size(s)
             output_tensor = torch.empty(
                 sum(output_split), device=self._device, dtype=input_tensor.dtype
             )
             with record_function(f"## all2all_data:kjt {label} ##"):
-                awaitable = dist.all_to_all_single(
-                    output=output_tensor,
-                    input=input_tensor,
-                    output_split_sizes=output_split,
-                    input_split_sizes=input_split,
-                    group=self._pg,
-                    async_op=True,
-                )
+                output_tensor = all_to_all_single(input_tensor, output_split, input_split, self._pg)
 
             self._output_tensors.append(output_tensor)
-            self._awaitables.append(awaitable)
 
     def _wait_impl(self) -> KeyedJaggedTensor:
         """
@@ -264,10 +273,7 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
             self._input.sync()
             return self._input
 
-        for awaitable in self._awaitables:
-            awaitable.wait()
-
-        return type(self._input).dist_init(
+        return self._input.__class__.dist_init(
             keys=self._keys,
             tensors=self._output_tensors,
             variable_stride_per_key=self._input.variable_stride_per_key(),
@@ -1177,6 +1183,7 @@ class SequenceEmbeddingsAllToAll(nn.Module):
             SequenceEmbeddingsAwaitable: awaitable of sequence embeddings.
         """
 
+        # TODO: this is known problem
         variable_batch_size = (
             batch_size_per_rank is not None and len(set(batch_size_per_rank)) > 1
         )

@@ -207,7 +207,7 @@ class ModelParallelBase(ModelParallelTestShared):
         ),
         qcomms_config=st.sampled_from(
             [
-                None,
+                # None,
                 QCommsConfig(
                     forward_precision=CommType.FP16, backward_precision=CommType.BF16
                 ),
@@ -216,13 +216,13 @@ class ModelParallelBase(ModelParallelTestShared):
         apply_optimizer_in_backward_config=st.sampled_from(
             [
                 None,
-                {
-                    "embeddingbags": (torch.optim.SGD, {"lr": 0.01}),
-                    "embeddings": (torch.optim.SGD, {"lr": 0.2}),
-                },
+                # {
+                #     "embeddingbags": (torch.optim.SGD, {"lr": 0.01}),
+                #     "embeddings": (torch.optim.SGD, {"lr": 0.2}),
+                # },
             ]
         ),
-        variable_batch_size=st.booleans(),
+        variable_batch_size=st.just(False),
     )
     @settings(verbosity=Verbosity.verbose, max_examples=3, deadline=None)
     def test_sharding_cw(

@@ -908,7 +908,7 @@ class InferGroupedPooledEmbeddingsLookup(
 ):
     def __init__(
         self,
-        grouped_configs_per_rank: List[List[GroupedEmbeddingConfig]],
+        grouped_configs_per_rank: Dict[int, List[GroupedEmbeddingConfig]],
         world_size: int,
         fused_params: Optional[Dict[str, Any]] = None,
         device: Optional[torch.device] = None,
@@ -943,7 +943,7 @@ class InferGroupedEmbeddingsLookup(
 ):
     def __init__(
         self,
-        grouped_configs_per_rank: List[List[GroupedEmbeddingConfig]],
+        grouped_configs_per_rank: Dict[int, List[GroupedEmbeddingConfig]],
         world_size: int,
         fused_params: Optional[Dict[str, Any]] = None,
         device: Optional[torch.device] = None,
@@ -979,7 +979,7 @@ class InferCPUGroupedEmbeddingsLookup(
 ):
     def __init__(
         self,
-        grouped_configs_per_rank: List[List[GroupedEmbeddingConfig]],
+        grouped_configs_per_rank: Dict[int, List[GroupedEmbeddingConfig]],
         world_size: int,
         fused_params: Optional[Dict[str, Any]] = None,
         device: Optional[torch.device] = None,

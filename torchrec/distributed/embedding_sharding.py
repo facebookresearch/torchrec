@@ -489,6 +489,12 @@ def group_tables(
         # Collect groups
         groups = defaultdict(list)
         grouping_keys = []
+        # Assumes all compute kernels within tables are the same
+        is_inference = (
+            embedding_tables[0].compute_kernel == EmbeddingComputeKernel.QUANT
+            if len(embedding_tables) > 0
+            else False
+        )
         for table in embedding_tables:
             bucketer = (
                 prefetch_cached_dim_bucketer
@@ -499,12 +505,16 @@ def group_tables(
                 _get_grouping_fused_params(table.fused_params, table.name) or {}
             )
             grouping_key = (
-                table.data_type,
+                table.data_type if not is_inference else None,
                 table.pooling,
                 table.has_feature_processor,
                 tuple(sorted(group_fused_params.items())),
                 _get_compute_kernel_type(table.compute_kernel),
-                bucketer.get_bucket(table.local_cols, table.data_type),
+                # TODO: Unit test to check if table.data_type affects table grouping
+                bucketer.get_bucket(
+                    table.local_cols,
+                    table.data_type,
+                ),
                 _prefetch_and_cached(table),
             )
             # micromanage the order of we traverse the groups to ensure backwards compatibility

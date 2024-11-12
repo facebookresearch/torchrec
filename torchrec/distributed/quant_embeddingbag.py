@@ -104,8 +104,12 @@ def create_infer_embedding_bag_sharding(
 ]:
     propogate_device: bool = get_propogate_device()
     if sharding_type == ShardingType.TABLE_WISE.value:
+        # default to not split shardings by data types, since FBGEMM supports multiple data types per 1 TBE
+        # TODO: Address use of data_types for non-TW sharding
         return InferTwEmbeddingSharding(
-            sharding_infos, env, device=device if propogate_device else None
+            sharding_infos,
+            env,
+            device=device if propogate_device else None,
         )
     elif sharding_type == ShardingType.ROW_WISE.value:
         return InferRwPooledEmbeddingSharding(

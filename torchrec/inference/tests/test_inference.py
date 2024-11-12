@@ -215,3 +215,50 @@ class InferenceTest(unittest.TestCase):
         # 3 TBES (1 FPEBC, 2 EBCs (1 weighted, 1 unweighted))
 
         self.assertEqual(num_tbes, 3)
+
+    def test_sharded_quantized_tbe_count(self) -> None:
+        set_propogate_device(True)
+        
+        model = TestSparseNN(
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            num_float_features=10,
+            dense_device=torch.device("cpu"),
+            sparse_device=torch.device("cpu"),
+            over_arch_clazz=TestOverArchRegroupModule,
+        )
+
+        per_table_weight_dtypes = {}
+
+        for table in self.tables + self.weighted_tables:
+            # quint4x2 different than int8, which is default
+            per_table_weight_dtypes[table.name] = torch.quint4x2 if table.name == "table_0" else torch.quint8
+
+        model.eval()
+        _, local_batch = ModelInput.generate(
+            batch_size=16,
+            world_size=1,
+            num_float_features=10,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+        )
+
+        # with torch.inference_mode(): # TODO: Why does inference mode fail when using different quant data types
+        model(local_batch[0])
+
+        # Quantize the model and collect quantized weights
+        quantized_model = quantize_inference_model(model, per_table_weight_dtype=per_table_weight_dtypes)
+        quantized_model(local_batch[0])
+        table_to_weight = get_table_to_weights_from_tbe(quantized_model)
+
+        # Shard the model, all weights are initialized back to 0, so have to reassign weights
+        sharded_quant_model, _ = shard_quant_model(
+            quantized_model,
+            world_size=1,
+            compute_device="cpu",
+            sharding_device="cpu",
+        )
+        assign_weights_to_tbe(quantized_model, table_to_weight)
+        # When world_size = 1, we should have 1 TBE per sharded, quantized ebc
+        self.assertTrue(len(sharded_quant_model.sparse.ebc.tbes) == 1)
+        self.assertTrue(len(sharded_quant_model.sparse.weighted_ebc.tbes) == 1)

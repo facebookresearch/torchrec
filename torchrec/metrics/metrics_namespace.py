@@ -66,6 +66,7 @@ class MetricName(MetricNameBase):
     NDCG = "ndcg"
     XAUC = "xauc"
     SCALAR = "scalar"
+    VARIANCE = "variance"
     OUTPUT = "output"
 
     TOTAL_POSITIVE_EXAMPLES = "total_positive_examples"
@@ -115,6 +116,7 @@ class MetricNamespace(MetricNamespaceBase):
     XAUC = "xauc"
 
     SCALAR = "scalar"
+    VARIANCE = "variance"
 
     PRECISION = "precision"
     RECALL = "recall"

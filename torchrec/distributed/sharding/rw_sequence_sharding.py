@@ -33,6 +33,7 @@ from torchrec.distributed.sharding.rw_sharding import (
     BaseRwEmbeddingSharding,
     get_embedding_shard_metadata,
     InferRwSparseFeaturesDist,
+    InputDistOutputs,
     RwSparseFeaturesDist,
 )
 from torchrec.distributed.sharding.sequence_sharding import (
